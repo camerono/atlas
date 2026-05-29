@@ -119,7 +119,14 @@ impl TransformerModel {
         // Capture isn't a useful win for HSS anyway: per-layer launch overhead
         // is small relative to the per-step disk I/O on the critical path.
         let hss_engaged = kv_cache.config().cache_blocks_per_seq.is_some();
-        let use_graphs = self.comm.is_none()
+        // EP-graph prototype: normally graphs are single-host only because
+        // NCCL all-reduce ran on a non-capturable path. The decode step's
+        // only collective is the MoE all-reduce, now routed through the
+        // multi-stream-capturable async path (moe/forward.rs), so allow
+        // graphs under EP when ATLAS_EP_GRAPHS is set. The slot-keyed graph
+        // cache below still keys per slot_idx, valid for n=1.
+        let ep_graphs = std::env::var("ATLAS_EP_GRAPHS").is_ok_and(|v| v == "1" || v == "true");
+        let use_graphs = (self.comm.is_none() || ep_graphs)
             && !self.profile
             && !self
                 .suppress_graphs

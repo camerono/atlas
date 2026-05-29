@@ -441,11 +441,16 @@ impl MoeLayer {
         if let Some(comm) = ctx.comm
             && comm.world_size() > 1
         {
-            if ctx.graph_capture {
-                comm.all_reduce(output.0, h as usize * 2)?;
-            } else {
-                comm.all_reduce_async(output.0, h as usize * 2, stream)?;
-            }
+            // Always use the event-based async all-reduce: it forks a comm
+            // stream off `stream` via CUDA events, runs the 2-rank
+            // send/recv/add there, and joins back. That fork-join pattern is
+            // multi-stream CUDA-graph-capturable — unlike the sync path
+            // (legacy_stream, not event-connected to the capture stream),
+            // which the old `graph_capture` branch wrongly selected. This is
+            // what lets CUDA graphs capture the decode step under EP
+            // (ATLAS_EP_GRAPHS); with graphs off it is the same async path EP
+            // already used.
+            comm.all_reduce_async(output.0, h as usize * 2, stream)?;
             // Now add shared expert contribution ONCE (after all-reduce).
             // Must apply the sigmoid gate: output += sigmoid(dot(input, gate_w)) * shared_out.
             // Using moe_batched_blend with num_tokens=1 computes the gate and blends correctly.
