@@ -23,6 +23,14 @@ impl Qwen3SsmLayer {
         let debug = tracing::enabled!(tracing::Level::DEBUG);
         let trace = false;
 
+        // ATLAS_SSM_SPLIT: complete two-sync mixer-vs-MoE split for one
+        // SSM layer-seq call (unlike the partial per-op prof! macro). One
+        // sync around the whole ssm_forward (mixer) span, one around the
+        // post-attn-norm + MoE span; emits a single SSMSPLIT line so the
+        // mixer:moe ratio isn't biased by per-op sync overhead.
+        let ssm_split =
+            !ctx.profile && std::env::var("ATLAS_SSM_SPLIT").is_ok_and(|v| v == "1" || v == "true");
+
         let ssm_state = state
             .as_any_mut()
             .downcast_mut::<SsmLayerState>()
@@ -46,7 +54,20 @@ impl Qwen3SsmLayer {
             Self::debug_bf16(ctx.gpu, "pre-norm", normed, 4);
         }
 
+        let ssm_split_t0 = if ssm_split {
+            ctx.gpu.synchronize(stream)?;
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         let ssm_out = self.ssm_forward(normed, ssm_state, ctx, stream, trace)?;
+        let ssm_split_mixer_us = match ssm_split_t0 {
+            Some(t0) => {
+                ctx.gpu.synchronize(stream)?;
+                Some(t0.elapsed().as_micros())
+            }
+            None => None,
+        };
         if debug {
             ctx.gpu.synchronize(stream)?;
             Self::debug_bf16(ctx.gpu, "ssm-out", ssm_out, 4);
@@ -89,6 +110,7 @@ impl Qwen3SsmLayer {
         }
 
         let normed2 = ctx.buffers.norm_output();
+        let ssm_split_moe_t0 = ssm_split_mixer_us.map(|_| std::time::Instant::now());
         ops::residual_add_rms_norm(
             ctx.gpu,
             self.residual_add_rms_norm_k,
@@ -110,6 +132,14 @@ impl Qwen3SsmLayer {
         }
 
         let moe_out = self.ffn.forward(normed2, ctx, stream)?;
+        if let (Some(mix), Some(t0)) = (ssm_split_mixer_us, ssm_split_moe_t0) {
+            ctx.gpu.synchronize(stream)?;
+            tracing::info!(
+                "SSMSPLIT mixer={}us moe={}us",
+                mix,
+                t0.elapsed().as_micros()
+            );
+        }
         if debug {
             ctx.gpu.synchronize(stream)?;
             Self::debug_bf16(ctx.gpu, "moe-output", moe_out, 8);

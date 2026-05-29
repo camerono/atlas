@@ -142,6 +142,22 @@ impl TransformerModel {
     ) -> Result<DevicePtr> {
         let n = tokens.len();
         let stream = self.gpu.default_stream();
+
+        // Phase-timing diagnostic for the k>1 decode dip (ATLAS_PHASE_TIMING).
+        //   kind   — host-sync per layer, bucket wall time by layer kind
+        //            (LinearAttention/SSM vs FullAttention) + lm_head. Decides
+        //            whether the SSM path is the bottleneck worth batching.
+        //   detail — flip ctx.profile on so the existing per-op SSM-mixer /
+        //            SSM-MoE logs fire, splitting SSM cost within a layer.
+        // Mutually exclusive: each adds host-syncs, so running both at once
+        // would have the two sync regimes distort each other's numbers.
+        let pt = std::env::var("ATLAS_PHASE_TIMING").ok();
+        let pt_kind = pt.as_deref() == Some("kind");
+        let pt_detail = pt.as_deref() == Some("detail");
+        let mut pt_ssm_us: u128 = 0;
+        let mut pt_attn_us: u128 = 0;
+        let mut pt_lmhead_us: u128 = 0;
+
         let h = self.config.hidden_size;
         let bf16 = 2usize;
         let fp32 = if self.config.use_fp32_residual() {
@@ -199,7 +215,7 @@ impl TransformerModel {
             gpu: self.gpu.as_ref(),
             config: &self.config,
             attn_metadata: Some(metadata),
-            profile: false,
+            profile: pt_detail,
             comm: self.comm_ref(),
             graph_capture: use_graphs,
         };
@@ -312,8 +328,12 @@ impl TransformerModel {
             dump_hidden("post_embed", stream)?;
 
             // Layer loop for padded_n sequences
+            if pt_kind {
+                self.gpu.synchronize(stream)?;
+            }
             for (layer_idx, layer) in self.layers.iter().enumerate() {
                 let mut layer_state_refs = extract_layer_refs(&mut all_layer_states, layer_idx);
+                let pt_t0 = pt_kind.then(std::time::Instant::now);
                 layer.decode_multi_seq(
                     hidden,
                     residual,
@@ -325,6 +345,15 @@ impl TransformerModel {
                     &ctx,
                     stream,
                 )?;
+                if let Some(t0) = pt_t0 {
+                    self.gpu.synchronize(stream)?;
+                    let us = t0.elapsed().as_micros();
+                    if self.config.layer_type(layer_idx) == LayerType::LinearAttention {
+                        pt_ssm_us += us;
+                    } else {
+                        pt_attn_us += us;
+                    }
+                }
                 if conc_hsd {
                     let _ = dump_hidden(&format!("after_L{:02}", layer_idx), stream);
                 }
@@ -345,6 +374,12 @@ impl TransformerModel {
             )?;
 
             // LM head: padded_n sequential GEMVs (weights in L2 after first)
+            let pt_lm0 = if pt_kind {
+                self.gpu.synchronize(stream)?;
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             let logits = self.buffers.logits();
             let v = self.config.vocab_size;
             for i in 0..padded_n {
@@ -375,6 +410,11 @@ impl TransformerModel {
                 }
             }
 
+            if let Some(t0) = pt_lm0 {
+                self.gpu.synchronize(stream)?;
+                pt_lmhead_us = t0.elapsed().as_micros();
+            }
+
             if use_graphs {
                 let graph = self.gpu.end_capture(stream)?;
                 if graph.0 != 0 {
@@ -396,6 +436,27 @@ impl TransformerModel {
         for (i, seq) in seqs.iter_mut().enumerate() {
             seq.tokens.push(tokens[i]);
             seq.seq_len += 1;
+        }
+
+        if pt_kind {
+            let total = pt_ssm_us + pt_attn_us + pt_lmhead_us;
+            let pct = |x: u128| {
+                if total > 0 {
+                    100.0 * x as f64 / total as f64
+                } else {
+                    0.0
+                }
+            };
+            tracing::info!(
+                "PHASE_TIMING n={n}: ssm={:.2}ms ({:.0}%) attn={:.2}ms ({:.0}%) lmhead={:.2}ms ({:.0}%) [sum={:.2}ms]",
+                pt_ssm_us as f64 / 1000.0,
+                pct(pt_ssm_us),
+                pt_attn_us as f64 / 1000.0,
+                pct(pt_attn_us),
+                pt_lmhead_us as f64 / 1000.0,
+                pct(pt_lmhead_us),
+                total as f64 / 1000.0,
+            );
         }
 
         Ok(self.decode_logits_ptr())
